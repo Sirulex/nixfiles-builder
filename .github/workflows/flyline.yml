@@ -1,0 +1,157 @@
+name: Build and cache Flyline
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flyline-attic
+  cancel-in-progress: false
+
+jobs:
+  cache-flyline:
+    name: Cache Flyline (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      FLYLINE_FLAKE: github:HalFrgrd/flyline
+
+    steps:
+      - name: Validate Attic secrets and cache access
+        env:
+          ATTIC_ENDPOINT: ${{ secrets.ATTIC_ENDPOINT }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
+          LC_ALL: C
+        run: |
+          endpoint_pattern='^https://[^/?#@[:space:][:cntrl:]]+(/[^?#[:space:][:cntrl:]]*)?$'
+          token_pattern='^[-A-Za-z0-9._~+/]+=*$'
+          cache_pattern='^[A-Za-z0-9][A-Za-z0-9_+-]{0,49}$'
+
+          if [[ ! "$ATTIC_ENDPOINT" =~ $endpoint_pattern || "$ATTIC_ENDPOINT" == *\\* ]]; then
+            echo '::error::ATTIC_ENDPOINT must be an HTTPS Attic API base URL.'
+            exit 1
+          fi
+          if [[ ! "$ATTIC_TOKEN" =~ $token_pattern ]]; then
+            echo '::error::ATTIC_TOKEN must contain the raw Attic API token.'
+            exit 1
+          fi
+          if [[ ! "$ATTIC_CACHE" =~ $cache_pattern ]]; then
+            echo '::error::ATTIC_CACHE must contain a valid Attic cache name.'
+            exit 1
+          fi
+
+          api="${ATTIC_ENDPOINT%/}/_api/v1"
+          curl_args=(--globoff --proto '=https' --fail --silent --retry 3 --max-time 20
+            --header "Authorization: Bearer $ATTIC_TOKEN")
+          if ! curl "${curl_args[@]}" "$api/cache-config/$ATTIC_CACHE" |
+            jq -e '.public_key | type == "string" and length > 0' >/dev/null 2>&1; then
+            echo '::error::Could not read the Attic cache. Verify the endpoint, cache name, and token pull access.'
+            exit 1
+          fi
+
+          # An empty path lookup checks push access without modifying the cache.
+          request=$(jq -cn --arg cache "$ATTIC_CACHE" '{cache: $cache, store_path_hashes: []}')
+          if ! curl "${curl_args[@]}" --json "$request" "$api/get-missing-paths" |
+            jq -e '.missing_paths == []' >/dev/null 2>&1; then
+            echo '::error::Could not query missing paths in Attic. Verify that the token has push access to the cache.'
+            exit 1
+          fi
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            sandbox = true
+            accept-flake-config = false
+
+      - name: Resolve the latest Flyline package
+        id: flyline
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          rev=$(nix flake metadata --refresh --no-update-lock-file --json "$FLYLINE_FLAKE" |
+            jq -er '.locked.rev | select(test("^[0-9a-f]{40}$"))')
+          package="$FLYLINE_FLAKE/$rev#packages.$SYSTEM.flyline"
+          out_path=$(nix eval --no-update-lock-file --raw "$package.outPath")
+          if [[ ! "$out_path" =~ ^/nix/store/[0-9a-df-np-sv-z]{32}-[^[:space:]/]+$ ]]; then
+            echo 'Flyline did not evaluate to a valid store path.' >&2
+            exit 1
+          fi
+          printf 'Flyline %s evaluates to %s\n' "$rev" "$out_path"
+          printf 'package=%s\nout_path=%s\n' "$package" "$out_path" >> "$GITHUB_OUTPUT"
+
+      - name: Check Attic for the package
+        id: cache
+        env:
+          ATTIC_ENDPOINT: ${{ secrets.ATTIC_ENDPOINT }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
+          OUT_PATH: ${{ steps.flyline.outputs.out_path }}
+        run: |
+          store_name=${OUT_PATH##*/}
+          store_hash=${store_name%%-*}
+          request=$(jq -cn --arg cache "$ATTIC_CACHE" --arg hash "$store_hash" \
+            '{cache: $cache, store_path_hashes: [$hash]}')
+          if ! response=$(curl --globoff --proto '=https' --fail --silent --retry 3 --max-time 20 \
+            --header "Authorization: Bearer $ATTIC_TOKEN" --json "$request" \
+            "${ATTIC_ENDPOINT%/}/_api/v1/get-missing-paths"); then
+            echo '::error::Could not check whether the Flyline package is cached in Attic.'
+            exit 1
+          fi
+          missing=$(jq -er --arg hash "$store_hash" '
+            if .missing_paths == [] then "false"
+            elif .missing_paths == [$hash] then "true"
+            else error("Unexpected response from Attic") end
+          ' <<< "$response")
+          printf 'missing=%s\n' "$missing" >> "$GITHUB_OUTPUT"
+          if [[ "$missing" == false ]]; then
+            echo 'Flyline is already in Attic. Skipping the build.'
+          fi
+
+      - name: Build Flyline and install the Attic client
+        if: steps.cache.outputs.missing == 'true'
+        env:
+          PACKAGE: ${{ steps.flyline.outputs.package }}
+        run: |
+          nix build --no-update-lock-file --print-build-logs --out-link "$RUNNER_TEMP/flyline" "$PACKAGE"
+          nix build --out-link "$RUNNER_TEMP/attic-client" 'github:NixOS/nixpkgs/nixos-26.05#attic-client'
+
+      - name: Push Flyline to Attic
+        if: steps.cache.outputs.missing == 'true'
+        env:
+          ATTIC_ENDPOINT: ${{ secrets.ATTIC_ENDPOINT }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+          ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
+          OUT_PATH: ${{ steps.flyline.outputs.out_path }}
+        run: |
+          attic="$RUNNER_TEMP/attic-client/bin/attic"
+          config_dir=$(mktemp -d)
+          trap 'rm -rf -- "$config_dir"' EXIT
+          export XDG_CONFIG_HOME="$config_dir"
+          "$attic" login ci "${ATTIC_ENDPOINT%/}/" "$ATTIC_TOKEN"
+
+          # Publish the package only after its dependencies have been uploaded.
+          references=$(nix-store --query --references "$OUT_PATH" | awk -v root="$OUT_PATH" '$0 != root')
+          if [[ -n "$references" ]]; then
+            mapfile -t dependencies <<< "$references"
+            "$attic" push "ci:$ATTIC_CACHE" "${dependencies[@]}"
+          fi
+          "$attic" push --no-closure --ignore-upstream-cache-filter "ci:$ATTIC_CACHE" "$OUT_PATH"
