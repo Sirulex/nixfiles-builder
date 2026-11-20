@@ -29,9 +29,6 @@ jobs:
       run:
         shell: bash
 
-    env:
-      FLYLINE_FLAKE: github:HalFrgrd/flyline
-
     steps:
       - name: Validate Attic secrets and cache access
         env:
@@ -82,20 +79,33 @@ jobs:
             sandbox = true
             accept-flake-config = false
 
-      - name: Resolve the latest Flyline package
+      - name: Refresh Flyline and Nixpkgs and resolve the package
         id: flyline
         env:
           SYSTEM: ${{ matrix.system }}
         run: |
-          rev=$(nix flake metadata --refresh --no-update-lock-file --json "$FLYLINE_FLAKE" |
-            jq -er '.locked.rev | select(test("^[0-9a-f]{40}$"))')
-          package="$FLYLINE_FLAKE/$rev#packages.$SYSTEM.flyline"
+          flake_dir="$RUNNER_TEMP/flyline-flake"
+          mkdir "$flake_dir"
+          cat > "$flake_dir/flake.nix" <<'EOF'
+          {
+            inputs.nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
+            inputs.flyline = {
+              url = "github:HalFrgrd/flyline";
+              inputs.nixpkgs.follows = "nixpkgs";
+            };
+            outputs = { flyline, ... }: { inherit (flyline) packages; };
+          }
+          EOF
+
+          flake="path:$flake_dir"
+          nix flake update --refresh --flake "$flake" flyline nixpkgs
+          package="$flake#packages.$SYSTEM.flyline"
           out_path=$(nix eval --no-update-lock-file --raw "$package.outPath")
           if [[ ! "$out_path" =~ ^/nix/store/[0-9a-df-np-sv-z]{32}-[^[:space:]/]+$ ]]; then
             echo 'Flyline did not evaluate to a valid store path.' >&2
             exit 1
           fi
-          printf 'Flyline %s evaluates to %s\n' "$rev" "$out_path"
+          printf 'Flyline evaluates to %s\n' "$out_path"
           printf 'package=%s\nout_path=%s\n' "$package" "$out_path" >> "$GITHUB_OUTPUT"
 
       - name: Check Attic for the package
