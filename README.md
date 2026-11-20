@@ -2,8 +2,6 @@
 
 # nixfiles-builder
 
-Created in [T3 Code](https://t3.codes).
-
 ## Flyline binary cache
 
 The [Flyline workflow](.github/workflows/flyline.yml) checks the upstream default
