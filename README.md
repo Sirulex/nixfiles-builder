@@ -6,7 +6,7 @@ The [Flyline workflow](.github/workflows/flyline.yml) runs at the start of every
 hour (UTC). Each run locks the latest upstream Flyline revision and the current
 Nixpkgs tarball from the `nixos-unstable` channel. Flyline follows that Nixpkgs
 input, as it does in Nixfiles. The builder checks Attic and builds and uploads
-any missing Flyline packages for `x86_64-linux` and `aarch64-linux`.
+the `x86_64-linux` Flyline package when it is missing.
 
 Nixfiles can use the cached package once its `flake.lock` pins the same two
 revisions. The builder keeps its lock file on the runner for the duration of the

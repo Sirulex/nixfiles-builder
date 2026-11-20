@@ -14,16 +14,8 @@ concurrency:
 
 jobs:
   cache-flyline:
-    name: Cache Flyline (${{ matrix.system }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - system: x86_64-linux
-            runner: ubuntu-24.04
-          - system: aarch64-linux
-            runner: ubuntu-24.04-arm
+    name: Cache Flyline (x86_64-linux)
+    runs-on: ubuntu-24.04
 
     defaults:
       run:
@@ -81,8 +73,6 @@ jobs:
 
       - name: Refresh Flyline and Nixpkgs and resolve the package
         id: flyline
-        env:
-          SYSTEM: ${{ matrix.system }}
         run: |
           flake_dir="$RUNNER_TEMP/flyline-flake"
           mkdir "$flake_dir"
@@ -99,7 +89,7 @@ jobs:
 
           flake="path:$flake_dir"
           nix flake update --refresh --flake "$flake" flyline nixpkgs
-          package="$flake#packages.$SYSTEM.flyline"
+          package="$flake#packages.x86_64-linux.flyline"
           out_path=$(nix eval --no-update-lock-file --raw "$package.outPath")
           if [[ ! "$out_path" =~ ^/nix/store/[0-9a-df-np-sv-z]{32}-[^[:space:]/]+$ ]]; then
             echo 'Flyline did not evaluate to a valid store path.' >&2
